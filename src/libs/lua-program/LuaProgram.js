@@ -53,7 +53,9 @@ const {
         lua_toboolean,
         lua_tonil,
         lua_tothread,
+        lua_topointer,
         lua_type,
+        lua_typename,
         lua_close,
         lua_istable,
     },
@@ -85,66 +87,11 @@ class LuaProgram {
      * @returns {string} output string usable by js
      * @private
      */
-    _decodeUint8Array(buffer) {
+    static decodeUint8Array(buffer) {
         if (buffer instanceof Uint8Array) {
             return Buffer.from(buffer).toString('utf8');
         }
         throw new TypeError(`type mismatch : expecting Uint8Array`);
-    }
-
-    /**
-     * Retrieve a value on Lua stack at the specified index
-     * @param L {*} Lua state
-     * @param index {number} stack index
-     * @returns {any}
-     * @private
-     */
-    _peekValue(L, index = -1) {
-        if (!lua_istable(L, index)) {
-            switch (lua_type(L, index)) {
-                case LUA_TNUMBER: {
-                    return lua_tonumber(L, index);
-                }
-                case LUA_TSTRING: {
-                    return this._decodeUint8Array(lua_tostring(L, index));
-                }
-                case LUA_TBOOLEAN: {
-                    return lua_toboolean(L, index);
-                }
-                case LUA_TNIL: {
-                    return null;
-                }
-                default: {
-                    throw new TypeError('unsupported lua type');
-                }
-            }
-        }
-
-        // the item is a table
-        const isArray = this._isArray(L, index);
-
-        if (isArray) {
-            // Cas d'un array Lua -> Array JavaScript
-            const arr = [];
-            const len = lua_len(L, index);
-            for (let i = 1; i <= len; i++) {
-                lua_pushnumber(L, i);
-                lua_gettable(L, index);
-                arr[i - 1] = this._peekValue(L, -1);
-                lua_pop(L, 1);
-            }
-            return arr;
-        } else {
-            // Cas d'un objet Lua -> Object JavaScript
-            const obj = {};
-            lua_pushnil(L);
-            while (L.next(index)) {
-                const key = lua_tostring(L, -2);
-                obj[key] = this._peekValue(L, -1);
-                lua_pop(L, 1); // Pop value, keep key until next iteration
-            }
-            return obj;
-        }
     }
 
     /**
@@ -160,27 +107,31 @@ class LuaProgram {
             // no need to continuer : this is not a table
             return false;
         }
-        const top = lua_gettop(L); // save stack status
-        lua_pushvalue(L, index);
-
+        const top = lua_gettop(L);
+        lua_pushvalue(L, index); // [table]
+        lua_pushnil(L); // [table, nil]
         let maxKey = 0;
         let count = 0;
 
-        lua_pushnil(L);
-
-        while (lua_next(L, -2)) {}
-
-        const len = lua_len(L, index);
-        for (let i = 1; i <= len; ++i) {
-            lua_pushnumber(L, i);
-            lua_gettable(L, index);
-            if (lua_isnil(L, -1)) {
-                lua_pop(L, 1);
+        while (lua_next(L, -2)) {
+            // [table, key, value]
+            const key = lua_tonumber(L, -2);
+            if (!Number.isInteger(key) || key < 1) {
+                // non-numeric key ou < 1 : this is not a numeric table
+                lua_pop(L, 2); // Clean stack
+                lua_settop(L, top); // Restore stack state
                 return false;
             }
-            lua_pop(L, 1);
+            if (key > maxKey) {
+                maxKey = key;
+            }
+            ++count;
+            lua_pop(L, 1); // Pop value and keep key for next iteration
         }
-        return true;
+        lua_pop(L, 1); // Clean stack by popping out the table copy
+        const isNumericArray = maxKey === count; // Checks maxKey == count (no missing index)
+        lua_settop(L, top); // Clean stack
+        return isNumericArray;
     }
 
     /**
@@ -234,6 +185,131 @@ class LuaProgram {
     }
 
     /**
+     * Returns an ordered list of numeric value.
+     * Fails if input list contains non-number values or if numeric offset are missing
+     * @param aList
+     * @private
+     */
+    _convertEntriesToOrderedArray(aList) {
+        if (aList.some((x) => typeof x[0] !== 'number')) {
+            console.log('some keys are not numbers', aList);
+            return null;
+        }
+        aList.sort((a, b) => a[0] - b[1]);
+        return aList.map((x) => x[1]);
+    }
+
+    static debugStack(L, message = 'Stack size :') {
+        const top = lua_gettop(L);
+        const output = {
+            message,
+            size: top,
+            stack: [],
+        };
+        for (let i = 1; i <= top; i++) {
+            const type = lua_type(L, i);
+            const typeName = LuaProgram.decodeUint8Array(lua_typename(L, type));
+            let value;
+            switch (type) {
+                case LUA_TNUMBER: {
+                    value = lua_tonumber(L, i);
+                    break;
+                }
+                case LUA_TSTRING: {
+                    value = `"${this._decodeStackString(L, i)}"`;
+                    break;
+                }
+                case LUA_TBOOLEAN: {
+                    value = lua_toboolean(L, i);
+                    break;
+                }
+                case LUA_TNIL: {
+                    value = 'nil';
+                    break;
+                }
+                case LUA_TTABLE: {
+                    const ptr = lua_topointer(L, i);
+                    value = '{table ' + ptr.id + '}';
+                    break;
+                }
+                default: {
+                    value = `unknown type: ${typeName}`;
+                    break;
+                }
+            }
+            output.stack.push({ typename: typeName, value });
+        }
+        return output;
+    }
+
+    _peekTable(L, index = -1) {
+        if (!lua_istable(L, index)) {
+            throw new TypeError(`index ${index} does not point toward a real lua table.`);
+        }
+        const bIsArray = this._isArray(L, index);
+
+        const top = lua_gettop(L); // save stack state
+        const objectEntries = [];
+
+        lua_pushvalue(L, index); // [..., table]
+
+        // Itération
+        lua_pushnil(L); // [..., table, nil]
+        let iter = 0;
+        while (lua_next(L, -2)) {
+            // [..., table, key, value]
+            const key = lua_isnumber(L, -2) ? lua_tonumber(L, -2) : this._decodeStackString(L, -2);
+            objectEntries.push([key, this._peekValue(L, -1)]);
+            lua_pop(L, 1); // [..., table, key]
+            ++iter;
+        }
+        // Nettoyage : pop la clé résiduelle et la copie de la table
+        // lua_pop(L, 1); // [..., table] → pop la clé
+        lua_pop(L, 1); // [...] → pop la copie de la table
+        lua_settop(L, top); // restore stack initial state
+
+        if (bIsArray) {
+            return this._convertEntriesToOrderedArray(objectEntries);
+        } else {
+            return Object.fromEntries(objectEntries);
+        }
+    }
+
+    _decodeStackString(L, index = -1) {
+        return LuaProgram.decodeUint8Array(lua_tostring(L, index));
+    }
+
+    /**
+     * Retrieve a value on Lua stack at the specified index
+     * @param L {*} Lua state
+     * @param index {number} stack index
+     * @returns {any}
+     * @private
+     */
+    _peekValue(L, index = -1) {
+        if (!lua_istable(L, index)) {
+            switch (lua_type(L, index)) {
+                case LUA_TNUMBER: {
+                    return lua_tonumber(L, index);
+                }
+                case LUA_TSTRING: {
+                    return this._decodeStackString(L, index);
+                }
+                case LUA_TBOOLEAN: {
+                    return lua_toboolean(L, index);
+                }
+                case LUA_TNIL: {
+                    return null;
+                }
+                default: {
+                    return `[Lua ${lua_typename(L, lua_type(L, index))}]`;
+                }
+            }
+        }
+        return this._peekTable(L, index);
+    }
+
+    /**
      * An error occurred in the specified coroutine, extract error,
      * clean stack and return error.
      * @param co the coroutine instance
@@ -241,7 +317,7 @@ class LuaProgram {
      * @private
      */
     _handleCoroutineError(co) {
-        const error = this._decodeUint8Array(lua_tostring(co, -1)); // read top stack value
+        const error = this._decodeStackString(co, -1); // read top stack value
         lua_pop(co, 1); // ... and removes it
         this.pendingResolvers.delete(co); // this coroutine is over
         return error; // return error message
@@ -254,11 +330,11 @@ class LuaProgram {
      */
     loadChunk(chunkCode, chunkName = 'chunk') {
         if (luaL_loadbuffer(this.L, Buffer.from(chunkCode), chunkName) !== LUA_OK) {
-            const error = lua_tostring(this.L, -1);
+            const error = this._decodeStackString(this.L, -1);
             throw new Error(`Chunk loading error "${chunkName}": ${error}`);
         }
         if (lua_pcall(this.L, 0, LUA_MULTRET, 0) !== LUA_OK) {
-            const error = lua_tostring(this.L, -1);
+            const error = this._decodeStackString(this.L, -1);
             throw new Error(`Chunk execution error "${chunkName}": ${error}`);
         }
     }
@@ -312,7 +388,7 @@ class LuaProgram {
         });
 
         if (lua_pcall(L, args.length, 1, 0) !== LUA_OK) {
-            const error = lua_tostring(this.L, -1);
+            const error = this._decodeStackString(this.L, -1);
             throw new Error(`Call error "${funcName}": ${error}`);
         }
 
@@ -335,6 +411,10 @@ class LuaProgram {
 
     isArray(index = -1) {
         return this._isArray(this.L, (index = -1));
+    }
+
+    getStackCount() {
+        return lua_gettop(this.L);
     }
 
     /**
