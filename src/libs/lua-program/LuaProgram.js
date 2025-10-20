@@ -253,7 +253,6 @@ class LuaProgram {
 
         lua_pushvalue(L, index); // [..., table]
 
-        // Itération
         lua_pushnil(L); // [..., table, nil]
         let iter = 0;
         while (lua_next(L, -2)) {
@@ -263,9 +262,7 @@ class LuaProgram {
             lua_pop(L, 1); // [..., table, key]
             ++iter;
         }
-        // Nettoyage : pop la clé résiduelle et la copie de la table
-        // lua_pop(L, 1); // [..., table] → pop la clé
-        lua_pop(L, 1); // [...] → pop la copie de la table
+        lua_pop(L, 1); // [...] → popping table copy out
         lua_settop(L, top); // restore stack initial state
 
         if (bIsArray) {
