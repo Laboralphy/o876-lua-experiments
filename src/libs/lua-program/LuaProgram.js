@@ -1,4 +1,6 @@
 const fengari = require('fengari');
+const { luaL_loadstring } = require('fengari/src/lauxlib');
+const { LUA_ERRRUN, LUA_TTHREAD } = require('fengari/src/lua');
 
 const {
     FENGARI_COPYRIGHT,
@@ -32,6 +34,7 @@ const {
         lua_yield,
         lua_settable,
         lua_pop,
+        lua_error,
         lua_pushboolean,
         lua_pushnumber,
         lua_pushnil,
@@ -39,8 +42,10 @@ const {
         lua_pushliteral,
         lua_pushstring,
         lua_pushvalue,
+        lua_pushthread,
         lua_len,
         lua_rawgeti,
+        lua_register,
         lua_remove,
         lua_next,
         lua_setfield,
@@ -78,7 +83,7 @@ class LuaProgram {
     constructor() {
         this.L = luaL_newstate();
         luaL_openlibs(this.L);
-        this.pendingResolvers = new Map();
+        this.pendingPromises = new Map();
     }
 
     /**
@@ -232,6 +237,11 @@ class LuaProgram {
                     value = '{table ' + ptr.id + '}';
                     break;
                 }
+                case LUA_TTHREAD: {
+                    const ptr = lua_tothread(L, i);
+                    value = '{thread ' + ptr.id + '}';
+                    break;
+                }
                 default: {
                     value = `unknown type: ${typeName}`;
                     break;
@@ -307,20 +317,6 @@ class LuaProgram {
     }
 
     /**
-     * An error occurred in the specified coroutine, extract error,
-     * clean stack and return error.
-     * @param co the coroutine instance
-     * @returns {string} error message
-     * @private
-     */
-    _handleCoroutineError(co) {
-        const error = this._decodeStackString(co, -1); // read top stack value
-        lua_pop(co, 1); // ... and removes it
-        this.pendingResolvers.delete(co); // this coroutine is over
-        return error; // return error message
-    }
-
-    /**
      * Loads a Lua Chunk in VM
      * @param {string} chunkCode
      * @param {string} chunkName
@@ -351,17 +347,152 @@ class LuaProgram {
      */
     bindFunction(name, func) {
         lua_pushcfunction(this.L, (L) => {
+            console.log('invoking', name);
             const nargs = lua_gettop(L); // top stack element is the number of args
             const args = []; // args for js function
             for (let i = 1; i <= nargs; i++) {
                 args.push(this._peekValue(L, i)); // copy stacks values to js parameters array
             }
             const result = func(...args); // call js function with args parameters array
-            this._pushValue(L, result); // push value
-            return 1;
+            if (result instanceof Promise) {
+                // we should be inside a co routine
+                if (!lua_isthread(L, 1)) {
+                    // not in coroutine
+                    throw new Error(`function ${name} must be invoked in a coroutine context`);
+                }
+                const co = lua_tothread(L, 1);
+                // we are in coroutine and the promise is pending,
+                // we should stop coroutine and wait for promise to either resolve or reject
+                result
+                    .then((result) => {
+                        // resolve handling
+                        this._pushValue(co, result);
+                        lua_resume(co, this.L, 1);
+                    })
+                    .catch((err) => {
+                        // error handling
+                        this._pushValue(co, err.message);
+                        lua_error(co); // Déclenche l'erreur
+                    });
+                lua_yield(L, 0);
+            } else {
+                this._pushValue(L, result); // push result
+                return 1;
+            }
         });
         lua_setglobal(this.L, name);
     }
+
+    /**
+     * A JS function has returns a promise,
+     * we should check that we are in coroutine
+     * @param co
+     * @param prom
+     * @private
+     */
+    _handleAsyncFunction(co, prom) {
+        prom.then((result) => {
+            // Reprend la coroutine avec le résultat
+            lua_resume(co, null, result);
+        }).catch((err) => {
+            lua_resume(co, null, err);
+        });
+    }
+
+    // Wrapper générique pour Lua
+    bindAsyncFunctions(L) {
+        // Expose une fonction Lua `call_async` qui prend :
+        // - le nom de la fonction JS
+        // - les arguments
+        lua_pushstring(L, 'call_async');
+        lua_pushcfunction(L, function (L) {
+            const funcName = lua_tostring(L, 1);
+            const args = [];
+            // Récupère les arguments (simplifié ici)
+            for (let i = 2; i <= lua.lua_gettop(L); i++) {
+                args.push(lua.lua_tostring(L, i));
+            }
+
+            if (!asyncFunctions[funcName]) {
+                lua.luaL_error(L, `Function ${funcName} not found`);
+                return 0;
+            }
+
+            // Appelle la fonction JS asynchrone
+            const promise = asyncFunctions[funcName](...args);
+            lua.lua_pushlightuserdata(L, promise);
+            return 1;
+        });
+        lua.lua_settable(L, lua.LUA_GLOBALSINDEX);
+
+        // Le wrapper 'await' (inchangé)
+        lua.lua_pushstring(L, 'await');
+        lua.lua_pushcfunction(L, function (L) {
+            const promise = lua.lua_touserdata(L, 1);
+            const co = lua.lua_tothread(L, 2);
+            promise
+                .then((result) => {
+                    lua.lua_pushthread(L, co);
+                    lua.lua_pushstring(L, JSON.stringify(result));
+                    lua.lua_resume(L, co, 1);
+                })
+                .catch((err) => {
+                    lua.lua_pushthread(L, co);
+                    lua.lua_pushstring(L, 'Error: ' + err.message);
+                    lua.lua_resume(L, co, 1);
+                });
+            return lua.LUA_YIELD;
+        });
+        lua.lua_settable(L, lua.LUA_GLOBALSINDEX);
+    }
+
+    // *runCoroutineGenerator(chunkCode) {
+    //     const co = lua_newthread(this.L);
+    //     luaL_loadstring(co, 'print(35)'); // Pas besoin de lua_pushthread ici
+    //
+    //     const status = lua_resume(co, this.L, 0);
+    //
+    //     if (status !== LUA_OK) {
+    //         const errorMessage = lua_tostring(co, -1); // Récupère le message d'erreur
+    //         console.error('Erreur dans la coroutine :', LuaProgram.decodeUint8Array(errorMessage));
+    //         lua_pop(co, 1); // Nettoie la pile
+    //     } else {
+    //         console.log('Coroutine exécutée avec succès.');
+    //     }
+    //
+    //     return;
+    //     while (true) {
+    //         console.log(LuaProgram.debugStack(co, 'starting iteration'));
+    //         const status = lua_resume(co, this.L, 0);
+    //         switch (status) {
+    //             case LUA_OK: {
+    //                 console.log('case ok');
+    //                 // coroutine has ended with an OK return code
+    //                 const result = this._peekValue(co);
+    //                 lua_pop(co, 1);
+    //                 lua_close(co);
+    //                 return result;
+    //             }
+    //             case LUA_YIELD: {
+    //                 console.log('case yield');
+    //                 // coroutine has invoked a yield
+    //                 // this is caused by an async function call
+    //                 console.log(LuaProgram.debugStack(co, 'coroutine stack'));
+    //                 yield;
+    //                 break;
+    //             }
+    //             default: {
+    //                 console.log('case error');
+    //                 // A runtime error occurred
+    //                 const error = this._decodeStackString(co, -1); // read top stack value
+    //                 lua_pop(co, 1); // ... and removes it
+    //                 // this.pendingResolvers.delete(co); // this coroutine is over
+    //                 lua_close(co);
+    //                 throw new Error(error); // return error message
+    //             }
+    //         }
+    //     }
+    // }
 
     /**
      * Calls a lua function by its name
@@ -369,26 +500,16 @@ class LuaProgram {
      * @param {Array} args
      * @returns {any}
      */
-    callFunction(funcName, args = []) {
+    callFunction(funcName, ...args) {
         const L = this.L;
         lua_getglobal(L, funcName);
         args.forEach((arg) => {
-            if (typeof arg === 'number') {
-                lua_pushnumber(L, arg);
-            } else if (typeof arg === 'string') {
-                lua_pushstring(L, arg);
-            } else if (typeof arg === 'boolean') {
-                lua_pushboolean(L, arg);
-            } else if (arg === null) {
-                lua_pushnil(L);
-            } else throw new Error(`Unsupported argument type: ${typeof arg}`);
+            this._pushValue(L, arg);
         });
-
         if (lua_pcall(L, args.length, 1, 0) !== LUA_OK) {
             const error = this._decodeStackString(this.L, -1);
             throw new Error(`Call error "${funcName}": ${error}`);
         }
-
         const result = this._peekValue(L, -1);
         lua_pop(L, 1);
         return result;
@@ -421,21 +542,5 @@ class LuaProgram {
         lua_close(this.L);
     }
 }
-
-// async function main() {
-//     const program = new LuaProgram();
-//
-//     program.loadPackage([
-//         { name: 'math_utils_package', code: 'function square(x) return x * x end' },
-//         {
-//             name: 'greet_package',
-//             code: "function greet(name) return 'Hello, ' .. name .. '! Square of 5 is ' .. square(5) end",
-//         },
-//     ]);
-//
-//     program.bindFunction('log', console.log);
-// }
-//
-// main().then(() => console.log('done.'));
 
 module.exports = LuaProgram;

@@ -224,3 +224,73 @@ describe('isArray', () => {
         l.close();
     });
 });
+
+describe('bindFunction', () => {
+    it('should return 55 when calling js function from lua', () => {
+        const l = new LuaProgram();
+        let result = 0;
+        l.bindFunction('exportResult', (n) => {
+            result = n;
+        });
+        l.loadChunk(
+            `exportResult(55)
+        `,
+            'code'
+        );
+        expect(result).toBe(55);
+    });
+});
+
+describe('loadPackage', function () {
+    it('should call a function from another chunk', () => {
+        const l = new LuaProgram();
+        let result = 0;
+        l.bindFunction('exportResult', (n) => {
+            result = n;
+        });
+        l.loadPackage([
+            {
+                name: 'chunk1',
+                code: `
+                    function main(n)
+                        exportResult(n * 2)
+                    end
+                `,
+            },
+            {
+                name: 'chunk2',
+                code: `
+                main(155)
+                `,
+            },
+        ]);
+        expect(result).toBe(310);
+    });
+});
+
+describe('callFunction', () => {
+    it('should return 44 when passing [11, 44, 33, 01] to a lua function that returns the greatest value', () => {
+        const l = new LuaProgram();
+        l.loadPackage([
+            {
+                name: 'chunk1',
+                code: `
+function myMaxFunction(tableau)
+    if #tableau == 0 then
+        return nil -- no values found in table
+    end
+    local max_val = tableau[1]
+    for i = 2, #tableau do
+        if tableau[i] > max_val then
+            max_val = tableau[i]
+        end
+    end
+    return max_val
+end
+`,
+            },
+        ]);
+        const x = l.callFunction('myMaxFunction', [11, 44, 33, 1]);
+        expect(x).toBe(44);
+    });
+});
