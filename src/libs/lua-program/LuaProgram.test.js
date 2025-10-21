@@ -239,6 +239,22 @@ describe('bindFunction', () => {
         );
         expect(result).toBe(55);
     });
+    it('should return 55 when calling js function from luawhen stack is full of things prior to calling', () => {
+        const l = new LuaProgram();
+        l.pushValue(456);
+        l.pushValue('abc');
+        l.pushValue('defgtrhrytj');
+        let result = 0;
+        l.bindFunction('exportResult', (n) => {
+            result = n;
+        });
+        l.loadChunk(
+            `exportResult(55)
+        `,
+            'code'
+        );
+        expect(result).toBe(55);
+    });
 });
 
 describe('loadPackage', function () {

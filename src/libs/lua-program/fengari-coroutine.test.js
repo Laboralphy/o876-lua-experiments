@@ -4,123 +4,145 @@ const lauxlib = fengari.lauxlib;
 const lualib = fengari.lualib;
 const LuaProgram = require('./LuaProgram');
 
-function set (L, funcName, func) {
+function set(luaState, funcName, func, promiseRegistry) {
     const wrapped = (L) => {
-        args = [...]; // read args from stack
-        res = func.call(null, ...args);
-        if (res instance of Promise && lua.lua_isyieldable(L)) { // if return a Promise and currently in a coroutine
+        console.log('wrapper: running function', funcName);
+        const nargs = lua.lua_gettop(L); // top stack element is the number of args
+        const args = []; // args for js function
+        for (let i = 1; i <= nargs; i++) {
+            args.push(lua.lua_tonumber(L, i)); // copy stacks values to js parameters array
+        }
+        const res = func(...args);
+        if (res instanceof Promise && lua.lua_isyieldable(L)) {
+            // if return a Promise and currently in a coroutine
             // if not in a coroutine, yield will throw an error about 'yield outside coroutine'
-            Promise.resolve(res).then(r => {
-                if (r === undefined) lua.lua_resume(L, from, 0);  // no return value
+            console.log('wrapper: waiting for promise to resolve');
+            promiseRegistry.set(L, res);
+            res.then((r) => {
+                console.log('wrapper: promise has resolved, result is', r);
+                if (r === undefined) {
+                    console.log('wrapper: lua_resume');
+                    lua.lua_resume(L, luaState, 0);
+                } // no return value
                 else {
-                    pushStack(L, r)
-                    lua.lua_resume(L, from, 1);  // only one return value
+                    lua.lua_pushnumber(L, r);
+                    console.log('wrapper: lua_resume');
+                    lua.lua_resume(L, luaState, 1); // only one return value
                 }
             });
-            return lua.lua_yield(L, 0);  // yield from outside to pause Lua code
+            console.log('wrapper: lua_yield');
+            return lua.lua_yield(L, 0); // yield from outside to pause Lua code
         } else {
-            pushStack(L, res);
-            return resNumber;  // push the res to stack and return res number
+            console.log('push imm value', res);
+            lua.lua_pushnumber(L, res);
+            return res; // push the res to stack and return res number
         }
     };
-    lua.lua_pushjsfunction(L, wrapped);
-    lua.lua_setglobal(L, funcName);
-};
-
-set('add', async (a, b) => {
-    await waitFor(10);  // wait for 10ms, which makes this function async and return a promise, Lua call will pause here to wait for return
-    return a + b;
-});
-
-/**
- * Crée une coroutine Lua à partir d'une fonction Lua et retourne une fonction JS pour la reprendre.
- * @param {fengari.lua.State} L - L'état Lua
- * @param {Function} luaFunction - La fonction Lua à envelopper (doit être sur le sommet de la stack)
- * @returns {Function} Une fonction JS qui reprend la coroutine
- */
-function wrapLuaCoroutine(L) {
-    // 1. Crée un nouveau thread (coroutine) à partir de la fonction Lua
-    const co = fengari.lua.lua_newthread(L);
-
-    // 2. Place la fonction Lua dans la stack du nouveau thread
-    fengari.lua.lua_pushvalue(L, -1); // Copie la fonction (supposée être sur le sommet de la stack)
-    fengari.lua.lua_xmove(L, co, 1); // Déplace la fonction vers le thread
-
-    return function (...args) {
-        console.log('x1');
-        // 3. Place les arguments sur la stack du thread
-        for (const arg of args) {
-            if (typeof arg === 'number') {
-                fengari.lua.lua_pushnumber(co, arg);
-            } else if (typeof arg === 'string') {
-                fengari.lua.lua_pushstring(co, arg);
-            }
-            // Ajoute d'autres types si nécessaire
-        }
-        console.log('x2');
-
-        // 4. Reprend la coroutine
-        const status = fengari.lua.lua_resume(co, L, args.length);
-        console.log('x3', status);
-
-        // 5. Récupère les résultats ou l'erreur
-        if (status === fengari.lua.LUA_YIELD) {
-            // La coroutine a yieldé : récupère les valeurs retournées
-            const results = [];
-            const nResults = fengari.lua.lua_gettop(co);
-            for (let i = 1; i <= nResults; i++) {
-                const type = fengari.lua.lua_type(co, i);
-                if (type === fengari.lua.LUA_TNUMBER) {
-                    results.push(fengari.lua.lua_tonumber(co, i));
-                } else if (type === fengari.lua.LUA_TSTRING) {
-                    results.push(fengari.lua.lua_tostring(co, i));
-                }
-                // Ajoute d'autres types si nécessaire
-            }
-            fengari.lua.lua_pop(co, nResults); // Nettoie la stack
-            return results.length > 0 ? results : undefined;
-        } else if (status === fengari.lua.LUA_OK) {
-            // La coroutine a terminé : récupère les valeurs de retour
-            const results = [];
-            const nResults = fengari.lua.lua_gettop(co);
-            for (let i = 1; i <= nResults; i++) {
-                const type = fengari.lua.lua_type(co, i);
-                if (type === fengari.lua.LUA_TNUMBER) {
-                    results.push(fengari.lua.lua_tonumber(co, i));
-                } else if (type === fengari.lua.LUA_TSTRING) {
-                    results.push(fengari.lua.lua_tostring(co, i));
-                }
-            }
-            fengari.lua.lua_pop(co, nResults);
-            return results.length > 0 ? results : undefined;
-        } else {
-            // Erreur
-            const err = fengari.lua.lua_tostring(co, -1);
-            fengari.lua.lua_pop(co, 1);
-            throw new Error(`Erreur dans la coroutine Lua: ${LuaProgram.decodeUint8Array(err)}`);
-        }
-    };
+    lua.lua_pushjsfunction(luaState, wrapped);
+    lua.lua_setglobal(luaState, funcName);
 }
 
-describe('test-coroutine', () => {
-    it('should successfully run a function in a coroutine', () => {
+async function add(a, b) {
+    return new Promise((resolve) => {
+        console.log('add: in promise, will add', a, '+', b);
+        setTimeout(() => {
+            console.log('add: resolved promise');
+            resolve(a + b);
+        }, 100);
+    });
+}
+
+describe('test coroutine 1', () => {
+    it('should work 1', async () => {
         const L = lauxlib.luaL_newstate();
-        lauxlib.luaL_dostring(
+        const promRegistry = new Map();
+        lualib.luaL_openlibs(L);
+        let RESULT;
+        set(
+            L,
+            'exportResult',
+            (n) => {
+                console.log('exportResult', n);
+                RESULT = n;
+            },
+            promRegistry
+        );
+        set(L, 'add', add, promRegistry);
+        lauxlib.luaL_loadstring(
             L,
             `
-    function ma_fonction(a, b)
-        coroutine.yield(a + b)
-        coroutine.yield(a * b)
-        return a - b
-    end
-`
-        );
-        const wrapped = wrapLuaCoroutine(L, null); // La fonction est déjà sur la stack
 
-        // Appels successifs
-        console.log(wrapped(2, 3)); // [5]
-        console.log(wrapped()); // [6]
-        console.log(wrapped()); // [-1]
-        console.log(wrapped()); // undefined
+        function main(a, b)
+            local r = add(33, 44)
+            exportResult(r)
+        end
+
+        `
+        );
+        const co = lua.lua_newthread(L);
+        let result = 'uninitialized';
+
+        // lua.lua_getglobal(co, 'add');
+        // lua.lua_pushnumber(co, 10);
+        // lua.lua_pushnumber(co, 20);
+        // const status = lua.lua_resume(co, L, 2);
+        lua.lua_getglobal(co, 'add');
+        lua.lua_pushnumber(co, 10);
+        lua.lua_pushnumber(co, 20);
+        const status = lua.lua_resume(co, L, 2);
+        if (status === lua.LUA_YIELD) {
+            const prom = promRegistry.get(co);
+            if (prom) {
+                console.log('main: we got the promise');
+                await prom;
+            } else {
+                console.log('main: no promise gotten');
+            }
+            console.log('main: status = yield');
+            // Récupérer le résultat (suppose une seule valeur de retour)
+            if (lua.lua_gettop(co) > 0) {
+                result = lua.lua_tonumber(co, -1); // Récupère la valeur au sommet de la pile
+                lua.lua_pop(co, 1); // Nettoie la pile
+                console.log('main: got yield with return value', result);
+            } else {
+                console.log('main: got yield with no return value');
+            }
+        } else if (status === lua.LUA_OK) {
+            console.log('main: status = ok');
+            console.log('main: result =', result);
+        } else {
+            // Gérer l'erreur
+            const errorMessage = lua.lua_tojsstring(co, -1);
+            lua.lua_pop(co, 1); // Nettoie la pile
+            throw new Error('Erreur dans la coroutine :' + errorMessage);
+        }
+    });
+});
+
+describe('test coroutine 2', () => {
+    it('should work 2', () => {
+        const code = `
+
+        function main()
+            local x = 10 + 20
+            exportResult(x)
+        end
+
+        main();
+        `;
+        const l = lauxlib.luaL_newstate();
+        lualib.luaL_openlibs(l);
+
+        set(l, 'exportResult', (x) => {
+            RESULT = x;
+        });
+
+        lauxlib.luaL_loadstring(l, code);
+
+        const co = lua.lua_newthread(l);
+
+        let RESULT;
+        const status = lua.lua_resume(co, l, 0);
+        console.log(RESULT, status);
     });
 });

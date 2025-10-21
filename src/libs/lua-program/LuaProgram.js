@@ -1,6 +1,6 @@
 const fengari = require('fengari');
 const { luaL_loadstring } = require('fengari/src/lauxlib');
-const { LUA_ERRRUN, LUA_TTHREAD } = require('fengari/src/lua');
+const { LUA_ERRRUN, LUA_TTHREAD, LUA_TFUNCTION } = require('fengari/src/lua');
 
 const {
     FENGARI_COPYRIGHT,
@@ -59,6 +59,7 @@ const {
         lua_tonil,
         lua_tothread,
         lua_topointer,
+        lua_tocfunction,
         lua_type,
         lua_typename,
         lua_close,
@@ -234,12 +235,17 @@ class LuaProgram {
                 }
                 case LUA_TTABLE: {
                     const ptr = lua_topointer(L, i);
-                    value = '{table ' + ptr.id + '}';
+                    value = '{table #' + ptr.id + '}';
                     break;
                 }
                 case LUA_TTHREAD: {
                     const ptr = lua_tothread(L, i);
-                    value = '{thread ' + ptr.id + '}';
+                    value = '{thread #' + ptr.id + '}';
+                    break;
+                }
+                case LUA_TFUNCTION: {
+                    const ptr = lua_tocfunction(L, i);
+                    value = '{function ' + ptr.name + '()}';
                     break;
                 }
                 default: {
@@ -247,7 +253,7 @@ class LuaProgram {
                     break;
                 }
             }
-            output.stack.push({ typename: typeName, value });
+            output.stack.push({ index: i - top - 1, value });
         }
         return output;
     }
